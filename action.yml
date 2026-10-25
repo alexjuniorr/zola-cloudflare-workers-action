@@ -1,0 +1,112 @@
+name: Zola to Cloudflare Workers
+description: Build a Zola site (with link checking) and deploy it to Cloudflare Workers as static assets.
+branding:
+  icon: upload-cloud
+  color: orange
+
+inputs:
+  api-token:
+    description: Cloudflare API token with the "Edit Cloudflare Workers" template. Required to deploy.
+    default: ""
+  account-id:
+    description: Cloudflare account ID. Only needed if the token has access to more than one account.
+    default: ""
+  worker-name:
+    description: Worker name. Defaults to the repository name. Ignored if the project has its own wrangler config.
+    default: ""
+  deploy:
+    description: '"auto" deploys on pushes, schedules and manual runs on the default branch (never on pull requests). Use "true" or "false" to force.'
+    default: auto
+  zola-version:
+    description: Zola version to install (without the "v").
+    default: "0.21.0"
+  working-directory:
+    description: Directory containing config.toml (and, optionally, your wrangler config).
+    default: "."
+  check-links:
+    description: Run `zola check --skip-external-links` before building.
+    default: "true"
+  pre-build-command:
+    description: Optional shell command run before the build (lint, tests, data validation). A non-zero exit fails the action.
+    default: ""
+
+outputs:
+  deployment-url:
+    description: URL of the deployed Worker (empty when nothing was deployed).
+    value: ${{ steps.cf.outputs.deployment-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Plan
+      id: plan
+      shell: bash
+      env:
+        DEPLOY: ${{ inputs.deploy }}
+        TOKEN: ${{ inputs.api-token }}
+        WORKER: ${{ inputs.worker-name || github.event.repository.name }}
+        EVENT: ${{ github.event_name }}
+        REF_NAME: ${{ github.ref_name }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+      run: |
+        if [ "$DEPLOY" = auto ]; then
+          if [ "$EVENT" != pull_request ] && [ "$REF_NAME" = "$DEFAULT_BRANCH" ]; then DEPLOY=true; else DEPLOY=false; fi
+        fi
+        if [ "$DEPLOY" = true ]; then
+          [ -n "$TOKEN" ] || { echo "::error::api-token is required to deploy"; exit 1; }
+          [[ "$WORKER" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "::error::invalid worker-name"; exit 1; }
+        fi
+        echo "deploy=$DEPLOY" >> "$GITHUB_OUTPUT"
+        echo "worker=$WORKER" >> "$GITHUB_OUTPUT"
+
+    - name: Pre-build command
+      if: inputs.pre-build-command != ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CMD: ${{ inputs.pre-build-command }}
+      run: bash -eo pipefail -c "$CMD"
+
+    - name: Install Zola
+      shell: bash
+      env:
+        VERSION: ${{ inputs.zola-version }}
+      run: |
+        curl -fsSL "https://github.com/getzola/zola/releases/download/v${VERSION}/zola-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+          | sudo tar xz -C /usr/local/bin
+        zola --version
+
+    - name: Check and build
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CHECK: ${{ inputs.check-links }}
+      run: |
+        [ "$CHECK" = "true" ] && zola check --skip-external-links
+        zola build
+
+    # Without a wrangler config in the project, generate one that serves ./public
+    # (with Zola's 404.html). With one, the project's own config is used untouched.
+    - name: Prepare Worker config
+      id: config
+      if: steps.plan.outputs.deploy == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        WORKER: ${{ steps.plan.outputs.worker }}
+      run: |
+        if ls wrangler.toml wrangler.json wrangler.jsonc >/dev/null 2>&1; then exit 0; fi
+        file="$RUNNER_TEMP/wrangler.json"
+        jq -n --arg name "$WORKER" --arg date "$(date -u +%F)" --arg dir "$PWD/public" \
+          '{name: $name, compatibility_date: $date, assets: {directory: $dir, not_found_handling: "404-page"}}' > "$file"
+        echo "args=--config=$file" >> "$GITHUB_OUTPUT"
+
+    - name: Deploy to Cloudflare Workers
+      id: cf
+      if: steps.plan.outputs.deploy == 'true'
+      uses: cloudflare/wrangler-action@v3
+      with:
+        apiToken: ${{ inputs.api-token }}
+        accountId: ${{ inputs.account-id }}
+        workingDirectory: ${{ inputs.working-directory }}
+        command: deploy ${{ steps.config.outputs.args }}
